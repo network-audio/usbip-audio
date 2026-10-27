@@ -38,12 +38,22 @@ jobs:
           if ($actual -ne '38cad6d4432b52d5bb9409d9ad03b72fdffc4ada4cd3a48fbeca1a2752a8518a') { throw "checksum mismatch: $actual" }
           $setup = Start-Process -FilePath ".\$installer" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/COMPONENTS=main,client' -Wait -PassThru
           if ($setup.ExitCode -notin @(0, 3010)) { throw "usbip-win2 setup returned $($setup.ExitCode)" }
+      - name: Allow desktop apps to record
+        shell: pwsh
+        run: |
+          foreach ($root in 'HKLM:', 'HKCU:') {
+            foreach ($key in 'microphone', 'microphone\NonPackaged') {
+              $path = "$root\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$key"
+              New-Item -Path $path -Force | Out-Null
+              Set-ItemProperty -Path $path -Name Value -Value Allow
+            }
+          }
       - name: Play and record through virtual USB Audio 2.0 devices
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $probe = '.\target\release\examples\uac2_probe.exe'
-          $devices = @('2x2', '8x8', '32x32', '64x64')
+          $devices = @('2x2', '8x8', '32x32', '42x42', '48x48', '64x64')
           $server = Start-Process -FilePath $probe -ArgumentList 'serve','--devices',($devices -join ','),'--attach','--expect','--seconds','300','--stop-file','stop.txt' -RedirectStandardOutput serve-out.log -RedirectStandardError serve-err.log -PassThru
           $failures = @()
           try {

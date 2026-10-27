@@ -192,6 +192,10 @@ mod wasapi {
         error.to_string()
     }
 
+    fn at(call: &'static str) -> impl Fn(windows::core::Error) -> String {
+        move |error| format!("{call}: {error}")
+    }
+
     fn endpoints(flow: EDataFlow) -> Result<Vec<(String, IMMDevice)>, String> {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().map_err(e)?;
         let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(e)?;
@@ -240,42 +244,42 @@ mod wasapi {
 
     pub fn render_test(name: &str) -> Result<(), String> {
         let (name, device) = endpoint(eRender, name)?;
-        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(e)?;
+        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(at("Activate"))?;
         let (format, channels, _) = mix_format(&client)?;
         let rate = unsafe { format.read_unaligned().nSamplesPerSec } as f32;
-        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, format, None) }.map_err(e)?;
-        let render: IAudioRenderClient = unsafe { client.GetService() }.map_err(e)?;
-        let buffer = unsafe { client.GetBufferSize() }.map_err(e)?;
-        unsafe { client.Start() }.map_err(e)?;
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, format, None) }.map_err(at("Initialize"))?;
+        let render: IAudioRenderClient = unsafe { client.GetService() }.map_err(at("GetService"))?;
+        let buffer = unsafe { client.GetBufferSize() }.map_err(at("GetBufferSize"))?;
+        unsafe { client.Start() }.map_err(at("Start"))?;
         let started = Instant::now();
         let mut frame = 0u64;
         while started.elapsed() < Duration::from_secs(4) {
-            let available = buffer - unsafe { client.GetCurrentPadding() }.map_err(e)?;
+            let available = buffer - unsafe { client.GetCurrentPadding() }.map_err(at("GetCurrentPadding"))?;
             if available > 0 {
-                let data = unsafe { render.GetBuffer(available) }.map_err(e)?;
+                let data = unsafe { render.GetBuffer(available) }.map_err(at("GetBuffer"))?;
                 let samples = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, available as usize * channels) };
                 for chunk in samples.chunks_mut(channels) {
                     let value = (frame as f32 * 440.0 * std::f32::consts::TAU / rate).sin() * 0.5;
                     chunk.fill(value);
                     frame += 1;
                 }
-                unsafe { render.ReleaseBuffer(available, 0) }.map_err(e)?;
+                unsafe { render.ReleaseBuffer(available, 0) }.map_err(at("ReleaseBuffer"))?;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        unsafe { client.Stop() }.map_err(e)?;
+        unsafe { client.Stop() }.map_err(at("Stop"))?;
         println!("rendered {frame} frames of 440 Hz to {name} ({channels} channels)");
         Ok(())
     }
 
     pub fn capture_test(name: &str) -> Result<(), String> {
         let (name, device) = endpoint(eCapture, name)?;
-        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(e)?;
+        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(at("Activate"))?;
         let (format, channels, _) = mix_format(&client)?;
         let rate = unsafe { format.read_unaligned().nSamplesPerSec } as f64;
-        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, format, None) }.map_err(e)?;
-        let capture: IAudioCaptureClient = unsafe { client.GetService() }.map_err(e)?;
-        unsafe { client.Start() }.map_err(e)?;
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, format, None) }.map_err(at("Initialize"))?;
+        let capture: IAudioCaptureClient = unsafe { client.GetService() }.map_err(at("GetService"))?;
+        unsafe { client.Start() }.map_err(at("Start"))?;
         // per channel: sum of squares, sign changes, last sign
         let mut stats = vec![(0f64, 0u64, false); channels];
         let mut frames = 0u64;
@@ -284,7 +288,7 @@ mod wasapi {
             loop {
                 let mut data = std::ptr::null_mut();
                 let (mut count, mut flags) = (0u32, 0u32);
-                unsafe { capture.GetBuffer(&mut data, &mut count, &mut flags, None, None) }.map_err(e)?;
+                unsafe { capture.GetBuffer(&mut data, &mut count, &mut flags, None, None) }.map_err(at("GetBuffer"))?;
                 if count == 0 {
                     break;
                 }
@@ -303,11 +307,11 @@ mod wasapi {
                     }
                     frames += count as u64;
                 }
-                unsafe { capture.ReleaseBuffer(count) }.map_err(e)?;
+                unsafe { capture.ReleaseBuffer(count) }.map_err(at("ReleaseBuffer"))?;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        unsafe { client.Stop() }.map_err(e)?;
+        unsafe { client.Stop() }.map_err(at("Stop"))?;
         println!("captured {frames} frames from {name} ({channels} channels)");
         if frames < rate as u64 {
             return Err(format!("captured only {frames} frames"));
