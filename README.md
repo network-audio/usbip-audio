@@ -9,7 +9,7 @@ A Rust process emulates USB audio devices and serves them over [USB/IP](https://
 - Windows' shared-mode audio engine opens at most 32 channels of a device (33 fail with `E_INVALIDARG`); exclusive-mode applications can use all of them (CI tests up to 64).
 - Isochronous transfers complete at the pace of a `Clock`, which so is the clock of the audio: Windows plays and records at its rate (e.g. a network media clock), without resampling.
 
-Used by [Inferno](https://github.com/stakach/inferno) (Dante) and [Win AirPlay](https://github.com/stakach/win-airplay).
+Used by [Inferno](https://github.com/network-audio/inferno) (Dante) and [Win AirPlay](https://github.com/network-audio/win-airplay).
 
 ## Sharing the driver
 

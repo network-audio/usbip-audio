@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.88"
 license = "MIT"
 description = "Virtual USB audio devices served over USB/IP, so an unmodified usbip-win2 driver presents them as Windows sound devices"
-repository = "https://github.com/stakach/usbip-audio"
+repository = "https://github.com/network-audio/usbip-audio"
 
 [dependencies]
 
