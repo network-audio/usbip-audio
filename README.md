@@ -6,6 +6,7 @@ A Rust process emulates USB audio devices and serves them over [USB/IP](https://
 
 - `Server` serves any `UsbDevice`. Pass port 0 to listen on a free port.
 - `uac2::Uac2Device` is a high-speed USB Audio Class 2.0 device (`usbaudio2.sys`) with a playback and/or a capture stream of up to 128 channels at 48 kHz (24-bit samples in 32-bit subslots).
+- Windows' shared-mode audio engine opens at most 32 channels of a device (33 fail with `E_INVALIDARG`); exclusive-mode applications can use all of them (CI tests up to 64).
 - Isochronous transfers complete at the pace of a `Clock`, which so is the clock of the audio: Windows plays and records at its rate (e.g. a network media clock), without resampling.
 
 Used by [Inferno](https://github.com/stakach/inferno) (Dante) and [Win AirPlay](https://github.com/stakach/win-airplay).

@@ -74,10 +74,12 @@ jobs:
             Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -match 'Probe' -or $_.InstanceId -match 'VID_1209' } | Format-Table -AutoSize Status, Class, FriendlyName, InstanceId | Out-String -Width 300 | Write-Host
             foreach ($device in $devices) {
               Write-Host "== $device"
+              # the shared-mode audio engine opens at most 32 channels; exclusive mode any number
+              $shared = [int]($device -split 'x')[0] -le 32
               & $probe render-test --endpoint "Probe $device"
-              if ($LASTEXITCODE -ne 0) { $failures += "render $device" }
+              if (($LASTEXITCODE -eq 0) -ne $shared) { $failures += "render $device (shared: $shared)" }
               & $probe capture-test --endpoint "Probe $device"
-              if ($LASTEXITCODE -ne 0) { $failures += "capture $device" }
+              if (($LASTEXITCODE -eq 0) -ne $shared) { $failures += "capture $device (shared: $shared)" }
               & $probe render-test --endpoint "Probe $device" --exclusive
               if ($LASTEXITCODE -ne 0) { $failures += "render $device exclusive" }
               & $probe capture-test --endpoint "Probe $device" --exclusive

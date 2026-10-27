@@ -42,9 +42,10 @@ pub struct Uac2Config {
     pub serial: String,
     /// A multiple of 8000 Hz (e.g. 48000, 96000)
     pub sample_rate: u32,
-    /// Channels Windows plays to the device (0 for none)
+    /// Channels Windows plays to the device (0 for none). Windows' shared-mode audio engine opens at most 32
+    /// channels: applications can only open more in exclusive mode.
     pub playback_channels: u16,
-    /// Channels Windows records from the device (0 for none)
+    /// Channels Windows records from the device (0 for none); at most 32 in shared mode, as for playback
     pub capture_channels: u16,
     /// Name of the playback terminal (shown by Windows as the output's name), if any
     pub playback_name: Option<String>,
