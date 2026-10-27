@@ -254,7 +254,11 @@ fn read_exact_active(
         match stream.read(&mut bytes[offset..]) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(count) => offset += count,
-            Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) => {}
             Err(error) => return Err(error),
         }
     }
