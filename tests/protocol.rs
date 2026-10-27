@@ -59,7 +59,16 @@ fn read(stream: &mut TcpStream, len: usize) -> Vec<u8> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn submit(seq: u32, direction: u32, ep: u32, length: u32, packets: u32, setup: [u8; 8], payload: &[u8], iso: &[(u32, u32)]) -> Vec<u8> {
+fn submit(
+    seq: u32,
+    direction: u32,
+    ep: u32,
+    length: u32,
+    packets: u32,
+    setup: [u8; 8],
+    payload: &[u8],
+    iso: &[(u32, u32)],
+) -> Vec<u8> {
     let mut out = vec![];
     for value in [1, seq, 0x0001_0001, direction, ep, 0, length, 0, packets, 0] {
         out.extend_from_slice(&u32::to_be_bytes(value));

@@ -207,12 +207,12 @@ impl<S: Uac2Streams> Uac2Device<S> {
 fn streaming_interface(out: &mut Vec<u8>, number: u8, terminal: u8, channels: u16, endpoint: u8, packet_bytes: usize) {
     out.extend_from_slice(&[9, 4, number, 0, 0, 0x01, 0x02, 0x20, 0]); // alternate 0: no bandwidth
     out.extend_from_slice(&[9, 4, number, 1, 1, 0x01, 0x02, 0x20, 0]); // alternate 1: streaming
-    // class-specific AS_GENERAL: PCM
+                                                                       // class-specific AS_GENERAL: PCM
     out.extend_from_slice(&[16, 0x24, 0x01, terminal, 0, 0x01, 0x01, 0, 0, 0, channels as u8]);
     out.extend_from_slice(&channel_config(channels).to_le_bytes());
     out.push(0);
     out.extend_from_slice(&[6, 0x24, 0x02, 0x01, SUBSLOT_BYTES as u8, BIT_RESOLUTION]); // FORMAT_TYPE_I
-    // high bandwidth: up to 3 transactions of at most 1024 bytes per microframe
+                                                                                        // high bandwidth: up to 3 transactions of at most 1024 bytes per microframe
     let transactions = packet_bytes.div_ceil(1024).max(1);
     let max_packet = (packet_bytes.div_ceil(transactions) | ((transactions - 1) << 11)) as u16;
     out.extend_from_slice(&[7, 5, endpoint, 0x0d]); // isochronous, synchronous, data
@@ -261,7 +261,8 @@ impl<S: Uac2Streams> UsbDevice for Uac2Device<S> {
         if playback.is_some() {
             input_terminal(&mut ac, PLAYBACK_INPUT_TERMINAL, 0x0101, c.playback_channels, 0); // USB streaming
             let label = name(&c.playback_name, STRING_PLAYBACK);
-            output_terminal(&mut ac, PLAYBACK_OUTPUT_TERMINAL, 0x0301, PLAYBACK_INPUT_TERMINAL, label); // speaker
+            output_terminal(&mut ac, PLAYBACK_OUTPUT_TERMINAL, 0x0301, PLAYBACK_INPUT_TERMINAL, label);
+            // speaker
         }
         if capture.is_some() {
             let label = name(&c.capture_name, STRING_CAPTURE);
@@ -318,7 +319,7 @@ impl<S: Uac2Streams> UsbDevice for Uac2Device<S> {
                 Ok(vec![state.alternates[interface as usize]])
             }
             (0x80, 0) | (0x81, 0) | (0x82, 0) => Ok(vec![0, 0]), // GET_STATUS
-            (0x02, 1) => Ok(vec![]),                              // CLEAR_FEATURE(ENDPOINT_HALT)
+            (0x02, 1) => Ok(vec![]),                             // CLEAR_FEATURE(ENDPOINT_HALT)
             (0x21 | 0xa1, _) if interface == 0 && (setup.index >> 8) as u8 == CLOCK_ID => {
                 drop(state);
                 self.clock_request(setup, data)

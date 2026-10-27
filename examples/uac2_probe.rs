@@ -125,9 +125,11 @@ fn serve(args: &[String]) -> Result<(), String> {
     let mut failures = vec![];
     for (spec, (_, probe, attached)) in &devices {
         let stats = &probe.stats;
-        let (playback, capture) = (stats.playback_frames.load(Ordering::Relaxed), stats.capture_frames.load(Ordering::Relaxed));
+        let (playback, capture) =
+            (stats.playback_frames.load(Ordering::Relaxed), stats.capture_frames.load(Ordering::Relaxed));
         let channels = stats.channels.lock().unwrap().clone();
-        let silent: Vec<usize> = channels.iter().enumerate().filter(|(_, c)| c.0 < 1 << 20).map(|(i, _)| i + 1).collect();
+        let silent: Vec<usize> =
+            channels.iter().enumerate().filter(|(_, c)| c.0 < 1 << 20).map(|(i, _)| i + 1).collect();
         println!(
             "{spec}: playback {playback} frames ({} s), {} discontinuities, capture {capture} frames ({} s)",
             playback / RATE as u64,
@@ -139,7 +141,8 @@ fn serve(args: &[String]) -> Result<(), String> {
             println!("  playback channel {}: peak {:.3}, ~{hz:.0} Hz", i + 1, *peak as f64 / i32::MAX as f64);
         }
         if probe.playback_channels > 0 && (channels.len() < probe.playback_channels || !silent.is_empty()) {
-            failures.push(format!("{spec}: playback channels without audio: {silent:?} of {}", probe.playback_channels));
+            failures
+                .push(format!("{spec}: playback channels without audio: {silent:?} of {}", probe.playback_channels));
         }
         if probe.capture_channels > 0 && capture < RATE as u64 {
             failures.push(format!("{spec}: capture read for less than a second"));
@@ -183,8 +186,8 @@ mod wasapi {
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
     use windows::Win32::Media::Audio::{
         eCapture, eRender, EDataFlow, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
-        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
-        WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED,
+        DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
     };
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ};
 
@@ -200,7 +203,8 @@ mod wasapi {
 
     fn endpoints(flow: EDataFlow) -> Result<Vec<(String, IMMDevice)>, String> {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().map_err(e)?;
-        let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(e)?;
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(e)?;
         let collection = unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }.map_err(e)?;
         let mut found = vec![];
         for index in 0..unsafe { collection.GetCount() }.map_err(e)? {
@@ -223,7 +227,8 @@ mod wasapi {
         let format = unsafe { client.GetMixFormat() }.map_err(e)?;
         let f = unsafe { format.read_unaligned() };
         let (tag, bits, channels) = (f.wFormatTag, f.wBitsPerSample, f.nChannels);
-        let sub_format = unsafe { std::ptr::addr_of!((*(format as *const WAVEFORMATEXTENSIBLE)).SubFormat).read_unaligned() };
+        let sub_format =
+            unsafe { std::ptr::addr_of!((*(format as *const WAVEFORMATEXTENSIBLE)).SubFormat).read_unaligned() };
         let float = tag == 3 || (tag == 0xfffe && sub_format == FLOAT);
         if !float || bits != 32 {
             return Err(format!("mix format is not 32-bit float: tag {tag:#x}, {bits} bits"));
@@ -277,7 +282,8 @@ mod wasapi {
                     SubFormat: PCM,
                 };
                 let (mut default, mut minimum) = (0i64, 0i64);
-                unsafe { client.GetDevicePeriod(Some(&mut default), Some(&mut minimum)) }.map_err(at("GetDevicePeriod"))?;
+                unsafe { client.GetDevicePeriod(Some(&mut default), Some(&mut minimum)) }
+                    .map_err(at("GetDevicePeriod"))?;
                 let format = &format as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
                 unsafe { client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 1_000_000, default, format, None) }
                     .map_err(at("Initialize (exclusive)"))?;
@@ -290,7 +296,11 @@ mod wasapi {
         }
 
         fn mode(&self) -> &'static str {
-            if self.exclusive { "exclusive" } else { "shared" }
+            if self.exclusive {
+                "exclusive"
+            } else {
+                "shared"
+            }
         }
     }
 

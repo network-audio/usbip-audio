@@ -122,18 +122,116 @@ impl<S: Uac1SpeakerStreams> UsbDevice for Uac1Speaker<S> {
 
     fn configuration_descriptor(&self) -> Vec<u8> {
         let mut out = vec![
-            9, 2, 0, 0, 2, 1, 0, 0x80, 50, // configuration
-            9, 4, 0, 0, 0, 1, 1, 0, 0, // AudioControl interface
-            9, 0x24, 1, 0, 1, 40, 0, 1, 1, // AC header, streaming interface 1
-            12, 0x24, 2, 1, 0x01, 0x01, 0, 2, 3, 0, 0, 0, // USB-streaming input terminal
-            10, 0x24, 6, 2, 1, 1, 3, 2, 2, 0, // mute/volume Feature Unit
-            9, 0x24, 3, 3, 0x01, 0x03, 0, 2, 0, // speaker output terminal
-            9, 4, 1, 0, 0, 1, 2, 0, 0, // AudioStreaming alt 0
-            9, 4, 1, 1, 1, 1, 2, 0, 0, // AudioStreaming alt 1
-            7, 0x24, 1, 1, self.config.delay_ms, 1, 0, // AS general, PCM; bDelay is USB frames (ms)
-            11, 0x24, 2, 1, 2, 2, 16, 1, 0x44, 0xac, 0, // 44.1 kHz stereo 16-bit
-            9, 5, SPEAKER_EP, 0x0d, 180, 0, 1, 0, 0, // synchronous isochronous OUT
-            7, 0x25, 1, 0, 0, 0, 0, // class-specific endpoint
+            9,
+            2,
+            0,
+            0,
+            2,
+            1,
+            0,
+            0x80,
+            50, // configuration
+            9,
+            4,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0, // AudioControl interface
+            9,
+            0x24,
+            1,
+            0,
+            1,
+            40,
+            0,
+            1,
+            1, // AC header, streaming interface 1
+            12,
+            0x24,
+            2,
+            1,
+            0x01,
+            0x01,
+            0,
+            2,
+            3,
+            0,
+            0,
+            0, // USB-streaming input terminal
+            10,
+            0x24,
+            6,
+            2,
+            1,
+            1,
+            3,
+            2,
+            2,
+            0, // mute/volume Feature Unit
+            9,
+            0x24,
+            3,
+            3,
+            0x01,
+            0x03,
+            0,
+            2,
+            0, // speaker output terminal
+            9,
+            4,
+            1,
+            0,
+            0,
+            1,
+            2,
+            0,
+            0, // AudioStreaming alt 0
+            9,
+            4,
+            1,
+            1,
+            1,
+            1,
+            2,
+            0,
+            0, // AudioStreaming alt 1
+            7,
+            0x24,
+            1,
+            1,
+            self.config.delay_ms,
+            1,
+            0, // AS general, PCM; bDelay is USB frames (ms)
+            11,
+            0x24,
+            2,
+            1,
+            2,
+            2,
+            16,
+            1,
+            0x44,
+            0xac,
+            0, // 44.1 kHz stereo 16-bit
+            9,
+            5,
+            SPEAKER_EP,
+            0x0d,
+            180,
+            0,
+            1,
+            0,
+            0, // synchronous isochronous OUT
+            7,
+            0x25,
+            1,
+            0,
+            0,
+            0,
+            0, // class-specific endpoint
         ];
         let length = out.len() as u16;
         out[2..4].copy_from_slice(&length.to_le_bytes());
@@ -268,7 +366,13 @@ mod tests {
     fn volume_controls_round_trip() {
         let device = speaker();
         let set = |selector: u16, channel: u16, data: &[u8]| {
-            let setup = Setup { request_type: 0x21, request: 1, value: selector << 8 | channel, index: 0x0200, length: data.len() as u16 };
+            let setup = Setup {
+                request_type: 0x21,
+                request: 1,
+                value: selector << 8 | channel,
+                index: 0x0200,
+                length: data.len() as u16,
+            };
             device.control(setup, data)
         };
         set(2, 0, &(-6 * 256i16).to_le_bytes()).unwrap();

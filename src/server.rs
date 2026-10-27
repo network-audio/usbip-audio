@@ -324,9 +324,7 @@ fn serve_imported(
     });
     let completer = {
         let (connection, device, clock) = (connection.clone(), device.clone(), clock.clone());
-        thread::Builder::new()
-            .name("usbip-iso".into())
-            .spawn(move || complete_iso(&connection, &*device, &*clock))?
+        thread::Builder::new().name("usbip-iso".into()).spawn(move || complete_iso(&connection, &*device, &*clock))?
     };
     let result = read_urbs(&mut stream, &connection, &*device, active, stop, &**clock);
     connection.pending.lock().unwrap().closed = true;
