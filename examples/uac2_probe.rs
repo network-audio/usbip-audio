@@ -4,8 +4,8 @@
 //!   device per `<playback>x<capture>` channel count, named `Probe <playback>x<capture>`. Capture channels carry
 //!   a 1 kHz sine. With `--expect`, exits with an error unless every device's playback channels received
 //!   audio and its capture was read.
-//! - Windows only: `uac2_probe list`, `uac2_probe render-test --endpoint NAME`,
-//!   `uac2_probe capture-test --endpoint NAME`.
+//! - Windows only: `uac2_probe list`, `uac2_probe render-test --endpoint NAME [--exclusive]`,
+//!   `uac2_probe capture-test --endpoint NAME [--exclusive]`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,14 +158,16 @@ fn serve(args: &[String]) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    let exclusive = args.iter().any(|a| a == "--exclusive");
     let result = match args.first().map(|s| s.as_str()) {
         Some("serve") => serve(&args),
         #[cfg(windows)]
         Some("list") => wasapi::list(),
         #[cfg(windows)]
-        Some("render-test") => wasapi::render_test(arg(&args, "--endpoint").unwrap_or_default()),
+        Some("render-test") => wasapi::render_test(arg(&args, "--endpoint").unwrap_or_default(), exclusive),
         #[cfg(windows)]
-        Some("capture-test") => wasapi::capture_test(arg(&args, "--endpoint").unwrap_or_default()),
+        Some("capture-test") => wasapi::capture_test(arg(&args, "--endpoint").unwrap_or_default(), exclusive),
         _ => Err("usage: uac2_probe serve|list|render-test|capture-test ...".into()),
     };
     if let Err(e) = result {
@@ -181,8 +183,8 @@ mod wasapi {
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
     use windows::Win32::Media::Audio::{
         eCapture, eRender, EDataFlow, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
-        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
-        WAVEFORMATEXTENSIBLE,
+        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+        WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
     };
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ};
 
@@ -242,12 +244,60 @@ mod wasapi {
         Ok(())
     }
 
-    pub fn render_test(name: &str) -> Result<(), String> {
+    const PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+
+    /// An initialised stream: shared mode in the mix format (32-bit float), or exclusive mode in the
+    /// device's own format (24 bits in 32-bit integers).
+    struct Stream {
+        client: IAudioClient,
+        channels: usize,
+        rate: f64,
+        exclusive: bool,
+    }
+
+    impl Stream {
+        fn open(device: &IMMDevice, exclusive: bool) -> Result<Self, String> {
+            let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(at("Activate"))?;
+            let mix = unsafe { client.GetMixFormat() }.map_err(at("GetMixFormat"))?;
+            let m = unsafe { mix.read_unaligned() };
+            let (channels, rate) = (m.nChannels, m.nSamplesPerSec);
+            if exclusive {
+                let format = WAVEFORMATEXTENSIBLE {
+                    Format: WAVEFORMATEX {
+                        wFormatTag: 0xfffe,
+                        nChannels: channels,
+                        nSamplesPerSec: rate,
+                        nAvgBytesPerSec: rate * 4 * channels as u32,
+                        nBlockAlign: 4 * channels,
+                        wBitsPerSample: 32,
+                        cbSize: 22,
+                    },
+                    Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 24 },
+                    dwChannelMask: if channels == 2 { 3 } else { 0 },
+                    SubFormat: PCM,
+                };
+                let (mut default, mut minimum) = (0i64, 0i64);
+                unsafe { client.GetDevicePeriod(Some(&mut default), Some(&mut minimum)) }.map_err(at("GetDevicePeriod"))?;
+                let format = &format as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+                unsafe { client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, 1_000_000, default, format, None) }
+                    .map_err(at("Initialize (exclusive)"))?;
+            } else {
+                mix_format(&client)?;
+                unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, mix, None) }
+                    .map_err(at("Initialize"))?;
+            }
+            Ok(Self { client, channels: channels as usize, rate: rate as f64, exclusive })
+        }
+
+        fn mode(&self) -> &'static str {
+            if self.exclusive { "exclusive" } else { "shared" }
+        }
+    }
+
+    pub fn render_test(name: &str, exclusive: bool) -> Result<(), String> {
         let (name, device) = endpoint(eRender, name)?;
-        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(at("Activate"))?;
-        let (format, channels, _) = mix_format(&client)?;
-        let rate = unsafe { format.read_unaligned().nSamplesPerSec } as f32;
-        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, format, None) }.map_err(at("Initialize"))?;
+        let stream = Stream::open(&device, exclusive)?;
+        let (client, channels) = (&stream.client, stream.channels);
         let render: IAudioRenderClient = unsafe { client.GetService() }.map_err(at("GetService"))?;
         let buffer = unsafe { client.GetBufferSize() }.map_err(at("GetBufferSize"))?;
         unsafe { client.Start() }.map_err(at("Start"))?;
@@ -257,10 +307,18 @@ mod wasapi {
             let available = buffer - unsafe { client.GetCurrentPadding() }.map_err(at("GetCurrentPadding"))?;
             if available > 0 {
                 let data = unsafe { render.GetBuffer(available) }.map_err(at("GetBuffer"))?;
-                let samples = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, available as usize * channels) };
-                for chunk in samples.chunks_mut(channels) {
-                    let value = (frame as f32 * 440.0 * std::f32::consts::TAU / rate).sin() * 0.5;
-                    chunk.fill(value);
+                for i in 0..available as usize {
+                    let value = (frame as f64 * 440.0 * std::f64::consts::TAU / stream.rate).sin() * 0.5;
+                    for ch in 0..channels {
+                        let at = i * channels + ch;
+                        unsafe {
+                            if stream.exclusive {
+                                *(data as *mut i32).add(at) = ((value * i32::MAX as f64) as i32) & !0xff;
+                            } else {
+                                *(data as *mut f32).add(at) = value as f32;
+                            }
+                        }
+                    }
                     frame += 1;
                 }
                 unsafe { render.ReleaseBuffer(available, 0) }.map_err(at("ReleaseBuffer"))?;
@@ -268,16 +326,14 @@ mod wasapi {
             std::thread::sleep(Duration::from_millis(5));
         }
         unsafe { client.Stop() }.map_err(at("Stop"))?;
-        println!("rendered {frame} frames of 440 Hz to {name} ({channels} channels)");
+        println!("rendered {frame} frames of 440 Hz to {name} ({channels} channels, {})", stream.mode());
         Ok(())
     }
 
-    pub fn capture_test(name: &str) -> Result<(), String> {
+    pub fn capture_test(name: &str, exclusive: bool) -> Result<(), String> {
         let (name, device) = endpoint(eCapture, name)?;
-        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(at("Activate"))?;
-        let (format, channels, _) = mix_format(&client)?;
-        let rate = unsafe { format.read_unaligned().nSamplesPerSec } as f64;
-        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1_000_000, 0, format, None) }.map_err(at("Initialize"))?;
+        let stream = Stream::open(&device, exclusive)?;
+        let (client, channels, rate) = (&stream.client, stream.channels, stream.rate);
         let capture: IAudioCaptureClient = unsafe { client.GetService() }.map_err(at("GetService"))?;
         unsafe { client.Start() }.map_err(at("Start"))?;
         // per channel: sum of squares, sign changes, last sign
@@ -294,15 +350,20 @@ mod wasapi {
                 }
                 // skip the first half second: the stream starting up
                 if started.elapsed() > Duration::from_millis(500) {
-                    let samples = unsafe { std::slice::from_raw_parts(data as *const f32, count as usize * channels) };
-                    for chunk in samples.chunks(channels) {
-                        for (stat, &s) in stats.iter_mut().zip(chunk) {
-                            stat.0 += (s as f64) * (s as f64);
-                            let positive = s > 0.0;
-                            if positive != stat.2 && s != 0.0 {
-                                stat.1 += 1;
-                                stat.2 = positive;
+                    for i in 0..count as usize * channels {
+                        let s = unsafe {
+                            if stream.exclusive {
+                                *(data as *const i32).add(i) as f64 / i32::MAX as f64
+                            } else {
+                                *(data as *const f32).add(i) as f64
                             }
+                        };
+                        let stat = &mut stats[i % channels];
+                        stat.0 += s * s;
+                        let positive = s > 0.0;
+                        if positive != stat.2 && s != 0.0 {
+                            stat.1 += 1;
+                            stat.2 = positive;
                         }
                     }
                     frames += count as u64;
@@ -312,7 +373,7 @@ mod wasapi {
             std::thread::sleep(Duration::from_millis(5));
         }
         unsafe { client.Stop() }.map_err(at("Stop"))?;
-        println!("captured {frames} frames from {name} ({channels} channels)");
+        println!("captured {frames} frames from {name} ({channels} channels, {})", stream.mode());
         if frames < rate as u64 {
             return Err(format!("captured only {frames} frames"));
         }
@@ -320,7 +381,9 @@ mod wasapi {
         for (i, (squares, crossings, _)) in stats.iter().enumerate() {
             let rms = (squares / frames as f64).sqrt();
             let hz = *crossings as f64 / 2.0 / (frames as f64 / rate);
-            println!("  channel {}: rms {rms:.3}, ~{hz:.0} Hz", i + 1);
+            if i < 2 || i + 1 == channels {
+                println!("  channel {}: rms {rms:.3}, ~{hz:.0} Hz", i + 1);
+            }
             if rms < 0.05 || (hz - 1000.0).abs() > 50.0 {
                 bad.push(i + 1);
             }

@@ -53,7 +53,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $probe = '.\target\release\examples\uac2_probe.exe'
-          $devices = @('2x2', '8x8', '32x32', '42x42', '48x48', '64x64')
+          $devices = @('2x2', '8x8', '32x32', '33x33', '48x48', '64x64')
           $server = Start-Process -FilePath $probe -ArgumentList 'serve','--devices',($devices -join ','),'--attach','--expect','--seconds','300','--stop-file','stop.txt' -RedirectStandardOutput serve-out.log -RedirectStandardError serve-err.log -PassThru
           $failures = @()
           try {
@@ -78,6 +78,10 @@ jobs:
               if ($LASTEXITCODE -ne 0) { $failures += "render $device" }
               & $probe capture-test --endpoint "Probe $device"
               if ($LASTEXITCODE -ne 0) { $failures += "capture $device" }
+              & $probe render-test --endpoint "Probe $device" --exclusive
+              if ($LASTEXITCODE -ne 0) { $failures += "render $device exclusive" }
+              & $probe capture-test --endpoint "Probe $device" --exclusive
+              if ($LASTEXITCODE -ne 0) { $failures += "capture $device exclusive" }
             }
           } finally {
             New-Item stop.txt -ItemType File -Force | Out-Null
