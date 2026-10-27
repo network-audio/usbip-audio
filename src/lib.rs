@@ -7,6 +7,7 @@
 //! - [`Server`] serves any [`UsbDevice`] over USB/IP. Several applications can share the installed driver: each
 //!   runs its own server on its own port (pass port 0 for a free one), attaching and detaching only its own
 //!   devices.
+//! - [`uac1::Uac1Speaker`] is a USB Audio Class 1.0 stereo speaker with volume and mute controls.
 //! - [`uac2::Uac2Device`] is a USB Audio Class 2.0 device with up to one playback (Windows to the device) and
 //!   one capture (device to Windows) streaming interface, of any channel count.
 //!
@@ -19,6 +20,7 @@
 mod clock;
 mod device;
 mod server;
+pub mod uac1;
 pub mod uac2;
 pub mod usbip_exe;
 
