@@ -1,0 +1,26 @@
+[package]
+name = "usbip-audio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Virtual USB audio devices served over USB/IP, so an unmodified usbip-win2 driver presents them as Windows sound devices"
+repository = "https://github.com/stakach/usbip-audio"
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Media"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }

@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  USBIP_VERSION: 0.9.8.1
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Windows binds usbaudio2.sys to the virtual devices, which play and record through WASAPI.
+  windows-usbip:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --example uac2_probe
+      - name: Install usbip-win2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = "USBip-$env:USBIP_VERSION-x64.exe"
+          Invoke-WebRequest -Uri "https://github.com/vadimgrn/usbip-win2/releases/download/v.$env:USBIP_VERSION/$installer" -OutFile $installer
+          $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          if ($actual -ne '38cad6d4432b52d5bb9409d9ad03b72fdffc4ada4cd3a48fbeca1a2752a8518a') { throw "checksum mismatch: $actual" }
+          $setup = Start-Process -FilePath ".\$installer" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/COMPONENTS=main,client' -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) { throw "usbip-win2 setup returned $($setup.ExitCode)" }
+      - name: Play and record through virtual USB Audio 2.0 devices
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = '.\target\release\examples\uac2_probe.exe'
+          $devices = @('2x2', '8x8', '32x32', '64x64')
+          $server = Start-Process -FilePath $probe -ArgumentList 'serve','--devices',($devices -join ','),'--attach','--expect','--seconds','300','--stop-file','stop.txt' -RedirectStandardOutput serve-out.log -RedirectStandardError serve-err.log -PassThru
+          $failures = @()
+          try {
+            for ($i = 0; $i -lt 60 -and -not (Select-String -Path serve-out.log -Pattern '^ready' -Quiet -ErrorAction SilentlyContinue); $i++) {
+              if ($server.HasExited) { throw 'the probe server exited' }
+              Start-Sleep -Seconds 1
+            }
+            Get-Content serve-out.log
+            # wait for Windows to create every endpoint
+            for ($i = 0; $i -lt 60; $i++) {
+              $listing = & $probe list | Out-String
+              $missing = @($devices | Where-Object { $listing -notmatch [regex]::Escape("Probe $_") })
+              if ($missing.Count -eq 0) { break }
+              Start-Sleep -Seconds 1
+            }
+            Write-Host $listing
+            & "$env:ProgramFiles\USBip\usbip.exe" port
+            Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -match 'Probe' -or $_.InstanceId -match 'VID_1209' } | Format-Table -AutoSize Status, Class, FriendlyName, InstanceId | Out-String -Width 300 | Write-Host
+            foreach ($device in $devices) {
+              Write-Host "== $device"
+              & $probe render-test --endpoint "Probe $device"
+              if ($LASTEXITCODE -ne 0) { $failures += "render $device" }
+              & $probe capture-test --endpoint "Probe $device"
+              if ($LASTEXITCODE -ne 0) { $failures += "capture $device" }
+            }
+          } finally {
+            New-Item stop.txt -ItemType File -Force | Out-Null
+            if (-not $server.WaitForExit(60000)) { Stop-Process -Id $server.Id -Force; $failures += 'probe server did not stop' }
+            Get-Content serve-out.log
+            Get-Content serve-err.log
+          }
+          if ($server.ExitCode -ne 0) { $failures += "probe server exited with $($server.ExitCode)" }
+          if ($failures.Count -gt 0) { throw "failed: $($failures -join ', ')" }
+      - name: Device diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_1209' } | ForEach-Object {
+            $_ | Format-List Status, Class, FriendlyName, InstanceId, Problem, ConfigManagerErrorCode | Out-String | Write-Host
+            Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_DriverInfPath, DEVPKEY_Device_Service -ErrorAction SilentlyContinue | Format-Table -AutoSize KeyName, Data | Out-String | Write-Host
+          }
