@@ -4,7 +4,8 @@
 //!   exports one device per `<playback>x<capture>[@<rate>]` (48 kHz by default), named `Probe <spec>`.
 //!   Capture channels carry a 1 kHz sine. With `--expect`, exits with an error unless every device's playback
 //!   channels received audio and its capture was read.
-//! - Windows only: `uac2_probe list`, `uac2_probe render-test --endpoint NAME [--exclusive]`,
+//! - Windows only: `uac2_probe list`, `uac2_probe render-test --endpoint NAME [--exclusive]` (NAME: the
+//!   device's, e.g. `Probe 2x2`),
 //!   `uac2_probe capture-test --endpoint NAME [--exclusive]`.
 
 use std::collections::BTreeMap;
@@ -223,7 +224,9 @@ mod wasapi {
     fn endpoint(flow: EDataFlow, name: &str) -> Result<(String, IMMDevice), String> {
         let all = endpoints(flow)?;
         let names: Vec<String> = all.iter().map(|(n, _)| n.clone()).collect();
-        all.into_iter().find(|(n, _)| n.contains(name)).ok_or(format!("no endpoint containing {name:?} in {names:?}"))
+        // "Speakers (Probe 2x2)": the device's whole name, not a prefix of another's (e.g. "Probe 2x2@44100")
+        let matches = |n: &str| n == name || n.ends_with(&format!("({name})"));
+        all.into_iter().find(|(n, _)| matches(n)).ok_or(format!("no endpoint of {name:?} in {names:?}"))
     }
 
     /// The shared-mode mix format: channels, and whether it is 32-bit float.
