@@ -54,7 +54,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $probe = '.\target\release\examples\uac2_probe.exe'
-          $devices = @('2x2', '8x8', '32x32', '33x33', '48x48', '64x64')
+          $devices = @('2x2', '8x8', '32x32', '33x33', '48x48', '64x64', '2x2@44100', '32x32@44100', '64x64@44100')
           $server = Start-Process -FilePath $probe -ArgumentList 'serve','--devices',($devices -join ','),'--attach','--expect','--seconds','300','--stop-file','stop.txt' -RedirectStandardOutput serve-out.log -RedirectStandardError serve-err.log -PassThru
           $failures = @()
           try {
@@ -76,7 +76,7 @@ jobs:
             foreach ($device in $devices) {
               Write-Host "== $device"
               # the shared-mode audio engine opens at most 32 channels; exclusive mode any number
-              $shared = [int]($device -split 'x')[0] -le 32
+              $shared = [int](($device -split '@')[0] -split 'x')[0] -le 32
               & $probe render-test --endpoint "Probe $device"
               if (($LASTEXITCODE -eq 0) -ne $shared) { $failures += "render $device (shared: $shared)" }
               & $probe capture-test --endpoint "Probe $device"

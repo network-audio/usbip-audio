@@ -3,8 +3,9 @@
 //! It has one fixed internal clock, and up to one playback stream (Windows to the device, an OUT endpoint) and
 //! one capture stream (device to Windows, an IN endpoint) of any number of channels. Samples are 24 bits in
 //! 32-bit (4-byte) subslots, i.e. `i32`s with the 24 most significant bits valid. Both endpoints are
-//! synchronous: every 125 µs microframe carries `sample_rate / 8000` frames, and the [`Server`](crate::Server)
-//! completes the transfers by its [`Clock`](crate::Clock), which so is the clock of both streams.
+//! synchronous: the 125 µs microframes carry `sample_rate / 8000` frames on average (whole frames: e.g. 6 at
+//! 48 kHz, 5 or 6 at 44.1 kHz), and the [`Server`](crate::Server) completes the transfers by its
+//! [`Clock`](crate::Clock), which so is the clock of both streams.
 
 use crate::device::{IsoEndpoint, IsoTiming, Setup, Speed, UsbDevice, EPIPE};
 use std::sync::Mutex;
@@ -40,7 +41,7 @@ pub struct Uac2Config {
     pub product: String,
     /// Distinguishes devices of the same vendor and product id: Windows remembers each one's settings by it
     pub serial: String,
-    /// A multiple of 8000 Hz (e.g. 48000, 96000)
+    /// e.g. 44100, 48000, 96000
     pub sample_rate: u32,
     /// Channels Windows plays to the device (0 for none). Windows' shared-mode audio engine opens at most 32
     /// channels: applications can only open more in exclusive mode.
@@ -54,16 +55,21 @@ pub struct Uac2Config {
 }
 
 impl Uac2Config {
-    fn frames_per_microframe(&self) -> usize {
+    /// Most frames a microframe carries.
+    fn max_frames_per_microframe(&self) -> usize {
+        self.sample_rate.div_ceil(8000) as usize
+    }
+    /// Fewest frames a microframe carries.
+    fn min_frames_per_microframe(&self) -> usize {
         (self.sample_rate / 8000) as usize
     }
     fn packet_bytes(&self, channels: u16) -> usize {
-        self.frames_per_microframe() * channels as usize * SUBSLOT_BYTES
+        self.max_frames_per_microframe() * channels as usize * SUBSLOT_BYTES
     }
     /// Checks the format fits into high-speed isochronous transfers.
     pub fn validate(&self) -> Result<(), String> {
-        if self.sample_rate == 0 || !self.sample_rate.is_multiple_of(8000) {
-            return Err(format!("sample rate {} is not a multiple of 8000 Hz", self.sample_rate));
+        if !(8000..=768_000).contains(&self.sample_rate) {
+            return Err(format!("sample rate {} Hz: 8000 to 768000 Hz", self.sample_rate));
         }
         if self.playback_channels == 0 && self.capture_channels == 0 {
             return Err("a device needs playback or capture channels".into());
@@ -110,6 +116,10 @@ impl<T: Uac2Streams + ?Sized> Uac2Streams for std::sync::Arc<T> {
 struct State {
     configuration: u8,
     alternates: [u8; 3],
+    /// Where the last playback transfer ended: (time, frame position). Windows chooses how many frames each
+    /// microframe carries (at e.g. 44.1 kHz, 5 or 6), so a transfer continuing the last one goes on from its
+    /// end, rather than from the clock's frame position, which may differ by a frame.
+    playback_end: Option<(u64, u64)>,
 }
 
 pub struct Uac2Device<S: Uac2Streams> {
@@ -136,6 +146,18 @@ fn channel_config(channels: u16) -> u32 {
 
 fn frame_at(ns: u64, rate: u32) -> u64 {
     (ns as u128 * rate as u128 / 1_000_000_000) as u64
+}
+
+/// How far the frames Windows played may run from the clock's before they're placed by the clock again.
+const PLAYBACK_DRIFT_FRAMES: u64 = 2;
+
+/// The frames each of `count` microframes starting at `start_ns` carries: whole frames, by the clock (the
+/// frames which start within it).
+fn microframe_frames(start_ns: u64, count: usize, rate: u32) -> impl Iterator<Item = usize> {
+    (0..count as u64).map(move |i| {
+        let at = start_ns + i * MICROFRAME_NS;
+        (frame_at(at + MICROFRAME_NS, rate) - frame_at(at, rate)) as usize
+    })
 }
 
 impl<S: Uac2Streams> Uac2Device<S> {
@@ -343,16 +365,28 @@ impl<S: Uac2Streams> UsbDevice for Uac2Device<S> {
             return;
         }
         let channels = self.config.playback_channels as usize;
-        let frames = self.config.frames_per_microframe();
-        let start = frame_at(timing.start_ns, self.config.sample_rate);
-        let mut samples = Vec::with_capacity(packets.len() * frames * channels);
+        let (min, max) = (self.config.min_frames_per_microframe(), self.config.max_frames_per_microframe());
+        let mut samples = Vec::with_capacity(packets.len() * max * channels);
         for packet in packets {
             // a short packet is padded with silence, so positions stay continuous
             let (whole, _) = packet.as_chunks::<SUBSLOT_BYTES>();
-            let count = whole.len().min(frames * channels) / channels * channels;
+            let count = whole.len().min(max * channels) / channels * channels;
             samples.extend(whole[..count].iter().map(|b| i32::from_le_bytes(*b)));
-            samples.resize(samples.len() + frames * channels - count, 0);
+            samples.resize(samples.len() + min.saturating_sub(count / channels) * channels, 0);
         }
+        let by_clock = frame_at(timing.start_ns, self.config.sample_rate);
+        let end_ns = timing.start_ns + packets.len() as u64 * timing.packet_ns;
+        let start = {
+            let mut state = self.state.lock().unwrap();
+            let start = match state.playback_end {
+                Some((ns, frame)) if ns == timing.start_ns && frame.abs_diff(by_clock) <= PLAYBACK_DRIFT_FRAMES => {
+                    frame
+                }
+                _ => by_clock,
+            };
+            state.playback_end = Some((end_ns, start + (samples.len() / channels) as u64));
+            start
+        };
         self.streams.playback(start, &samples);
     }
 
@@ -361,16 +395,20 @@ impl<S: Uac2Streams> UsbDevice for Uac2Device<S> {
             return vec![0; capacity.len()];
         }
         let channels = self.config.capture_channels as usize;
-        let frames = self.config.frames_per_microframe();
-        let start = frame_at(timing.start_ns, self.config.sample_rate);
-        let mut samples = vec![0i32; capacity.len() * frames * channels];
+        let rate = self.config.sample_rate;
+        let start = frame_at(timing.start_ns, rate);
+        let frames: Vec<usize> = microframe_frames(timing.start_ns, capacity.len(), rate).collect();
+        let mut samples = vec![0i32; frames.iter().sum::<usize>() * channels];
         self.streams.capture(start, &mut samples);
-        let packet_bytes = frames * channels * SUBSLOT_BYTES;
+        let mut packets = samples.as_slice();
         capacity
             .iter()
-            .zip(samples.chunks(frames * channels))
-            .map(|(&capacity, packet)| {
-                let len = packet_bytes.min(capacity / (channels * SUBSLOT_BYTES) * channels * SUBSLOT_BYTES);
+            .zip(frames)
+            .map(|(&capacity, frames)| {
+                let (packet, rest) = packets.split_at(frames * channels);
+                packets = rest;
+                let len = (frames * channels * SUBSLOT_BYTES)
+                    .min(capacity / (channels * SUBSLOT_BYTES) * channels * SUBSLOT_BYTES);
                 for sample in &packet[..len / SUBSLOT_BYTES] {
                     data.extend_from_slice(&sample.to_le_bytes());
                 }
@@ -507,5 +545,87 @@ mod tests {
         assert_eq!(data.len(), 112);
         let second_packet_first = i32::from_le_bytes(data[48..52].try_into().unwrap());
         assert_eq!(second_packet_first, 12 << 8, "positions continue across packets");
+    }
+
+    fn device(playback: u16, capture: u16, rate: u32) -> Uac2Device<Recorder> {
+        Uac2Device::new(Uac2Config { sample_rate: rate, ..config(playback, capture) }, Recorder::default()).unwrap()
+    }
+
+    #[test]
+    fn validates_rates_not_multiples_of_8000() {
+        let c = |rate| Uac2Config { sample_rate: rate, ..config(2, 2) };
+        assert!(c(44100).validate().is_ok());
+        assert!(c(88200).validate().is_ok());
+        assert!(c(7999).validate().is_err());
+        // at 44.1 kHz, up to 6 frames a microframe: 128 channels need 3072 bytes, as at 48 kHz
+        assert!(Uac2Config { sample_rate: 44100, ..config(128, 128) }.validate().is_ok());
+        assert!(Uac2Config { sample_rate: 44100, ..config(129, 0) }.validate().is_err());
+    }
+
+    #[test]
+    fn capture_microframes_carry_5_or_6_frames_at_44100() {
+        let device = device(0, 2, 44100);
+        // 10 ms: 80 microframes, 441 frames
+        let timing = IsoTiming { start_ns: 3 * MICROFRAME_NS, packet_ns: MICROFRAME_NS };
+        let mut data = vec![];
+        let lengths = device.iso_in(CAPTURE_EP, timing, &[1000; 80], &mut data);
+        let frames: Vec<usize> = lengths.iter().map(|l| l / 8).collect();
+        assert!(frames.iter().all(|&f| f == 5 || f == 6), "{frames:?}");
+        assert_eq!(frames.iter().sum::<usize>(), 441);
+        assert_eq!(data.len(), 441 * 8);
+        // samples continue across microframes (the recorder numbers them from the first frame's position)
+        let samples: Vec<i32> = data.chunks(4).map(|b| i32::from_le_bytes(b.try_into().unwrap()) >> 8).collect();
+        let first = frame_at(timing.start_ns, 44100) as i32;
+        assert!(samples.iter().enumerate().all(|(k, &s)| s == first + k as i32), "{:?}", &samples[..12]);
+    }
+
+    #[test]
+    fn microframe_frames_add_up_by_the_clock() {
+        for rate in [44100, 48000, 88200, 96000] {
+            let start = 12_345 * MICROFRAME_NS;
+            let total: usize = microframe_frames(start, 8000, rate).sum();
+            assert_eq!(total as u64, frame_at(start + 8000 * MICROFRAME_NS, rate) - frame_at(start, rate));
+            assert_eq!(total, rate as usize, "{rate}: a second of microframes");
+        }
+    }
+
+    #[test]
+    fn playback_continues_across_transfers_in_windows_pattern() {
+        let device = device(2, 0, 44100);
+        let frames =
+            |n: usize, from: i32| -> Vec<u8> { (from..from + n as i32 * 2).flat_map(|s| s.to_le_bytes()).collect() };
+        // Windows' own pattern of 6 and 5: a frame ahead of the clock's after the first microframe
+        let (a, b) = (frames(6, 0), frames(5, 12));
+        let first = IsoTiming { start_ns: 0, packet_ns: MICROFRAME_NS };
+        device.iso_out(PLAYBACK_EP, first, &[&a, &b]);
+        let (c, d) = (frames(6, 22), frames(5, 34));
+        let second = IsoTiming { start_ns: 2 * MICROFRAME_NS, packet_ns: MICROFRAME_NS };
+        device.iso_out(PLAYBACK_EP, second, &[&c, &d]);
+        let played = device.streams().played.lock().unwrap();
+        assert_eq!(played[0].0, 0);
+        assert_eq!(played[0].1.len(), 22, "11 frames, unpadded");
+        assert_eq!(frame_at(second.start_ns, 44100), 11, "where the clock puts the second transfer");
+        assert_eq!(played[1].0, 11, "continues where the first ended");
+        // after a gap (not continuing the last transfer): by the clock again
+        let later = IsoTiming { start_ns: 100 * MICROFRAME_NS, packet_ns: MICROFRAME_NS };
+        drop(played);
+        device.iso_out(PLAYBACK_EP, later, &[&c]);
+        assert_eq!(device.streams().played.lock().unwrap()[2].0, frame_at(later.start_ns, 44100));
+    }
+
+    #[test]
+    fn playback_drifting_from_the_clock_is_placed_by_it_again() {
+        let device = device(2, 0, 44100);
+        let six: Vec<u8> = (0..12i32).flat_map(|s| s.to_le_bytes()).collect();
+        // always 6 frames: runs ahead of the clock (5.5125 a microframe on average)
+        for i in 0..8u64 {
+            let timing = IsoTiming { start_ns: i * MICROFRAME_NS, packet_ns: MICROFRAME_NS };
+            device.iso_out(PLAYBACK_EP, timing, &[&six]);
+        }
+        let played = device.streams().played.lock().unwrap();
+        for (i, (frame, _)) in played.iter().enumerate() {
+            let by_clock = frame_at(i as u64 * MICROFRAME_NS, 44100);
+            assert!(frame.abs_diff(by_clock) <= PLAYBACK_DRIFT_FRAMES, "transfer {i}: {frame} vs {by_clock}");
+        }
     }
 }

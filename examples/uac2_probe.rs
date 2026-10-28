@@ -1,9 +1,9 @@
 //! Exports test devices and checks Windows plays and records through them (see the Windows CI job).
 //!
-//! - `uac2_probe serve --devices 2x2,8x8 --seconds 120 [--attach] [--stop-file F] [--expect]`: exports one
-//!   device per `<playback>x<capture>` channel count, named `Probe <playback>x<capture>`. Capture channels carry
-//!   a 1 kHz sine. With `--expect`, exits with an error unless every device's playback channels received
-//!   audio and its capture was read.
+//! - `uac2_probe serve --devices 2x2,8x8,2x2@44100 --seconds 120 [--attach] [--stop-file F] [--expect]`:
+//!   exports one device per `<playback>x<capture>[@<rate>]` (48 kHz by default), named `Probe <spec>`.
+//!   Capture channels carry a 1 kHz sine. With `--expect`, exits with an error unless every device's playback
+//!   channels received audio and its capture was read.
 //! - Windows only: `uac2_probe list`, `uac2_probe render-test --endpoint NAME [--exclusive]`,
 //!   `uac2_probe capture-test --endpoint NAME [--exclusive]`.
 
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use usbip_audio::uac2::{Uac2Config, Uac2Device, Uac2Streams};
 use usbip_audio::{usbip_exe, MonotonicClock, Server};
 
-const RATE: u32 = 48000;
+const DEFAULT_RATE: u32 = 48000;
 const CAPTURE_HZ: f64 = 1000.0;
 
 #[derive(Default)]
@@ -30,6 +30,7 @@ struct Stats {
 struct Probe {
     playback_channels: usize,
     capture_channels: usize,
+    rate: u32,
     stats: Stats,
 }
 
@@ -57,7 +58,7 @@ impl Uac2Streams for Probe {
 
     fn capture(&self, frame: u64, samples: &mut [i32]) {
         for (i, chunk) in samples.chunks_mut(self.capture_channels).enumerate() {
-            let t = (frame + i as u64) as f64 / RATE as f64;
+            let t = (frame + i as u64) as f64 / self.rate as f64;
             let value = ((t * CAPTURE_HZ * std::f64::consts::TAU).sin() * 0.25 * i32::MAX as f64) as i32;
             chunk.fill(value & !0xff);
         }
@@ -79,7 +80,9 @@ fn serve(args: &[String]) -> Result<(), String> {
 
     let mut devices = BTreeMap::new();
     for (index, spec) in specs.split(',').enumerate() {
-        let (playback, capture) = spec.split_once('x').ok_or(format!("bad device {spec:?}"))?;
+        let (channels, rate) = spec.split_once('@').unwrap_or((spec, ""));
+        let rate: u32 = if rate.is_empty() { DEFAULT_RATE } else { rate.parse().map_err(|_| "rate")? };
+        let (playback, capture) = channels.split_once('x').ok_or(format!("bad device {spec:?}"))?;
         let (playback, capture): (u16, u16) =
             (playback.parse().map_err(|_| "channels")?, capture.parse().map_err(|_| "channels")?);
         let config = Uac2Config {
@@ -89,7 +92,7 @@ fn serve(args: &[String]) -> Result<(), String> {
             manufacturer: "usbip-audio".into(),
             product: format!("Probe {spec}"),
             serial: format!("probe-{spec}"),
-            sample_rate: RATE,
+            sample_rate: rate,
             playback_channels: playback,
             capture_channels: capture,
             playback_name: None,
@@ -98,6 +101,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         let probe = Arc::new(Probe {
             playback_channels: playback as usize,
             capture_channels: capture as usize,
+            rate,
             stats: Default::default(),
         });
         let device = Arc::new(Uac2Device::new(config, probe.clone())?);
@@ -132,19 +136,19 @@ fn serve(args: &[String]) -> Result<(), String> {
             channels.iter().enumerate().filter(|(_, c)| c.0 < 1 << 20).map(|(i, _)| i + 1).collect();
         println!(
             "{spec}: playback {playback} frames ({} s), {} discontinuities, capture {capture} frames ({} s)",
-            playback / RATE as u64,
+            playback / probe.rate as u64,
             stats.playback_gaps.load(Ordering::Relaxed),
-            capture / RATE as u64
+            capture / probe.rate as u64
         );
         for (i, (peak, crossings, _)) in channels.iter().enumerate() {
-            let hz = *crossings as f64 / 2.0 / (playback.max(1) as f64 / RATE as f64);
+            let hz = *crossings as f64 / 2.0 / (playback.max(1) as f64 / probe.rate as f64);
             println!("  playback channel {}: peak {:.3}, ~{hz:.0} Hz", i + 1, *peak as f64 / i32::MAX as f64);
         }
         if probe.playback_channels > 0 && (channels.len() < probe.playback_channels || !silent.is_empty()) {
             failures
                 .push(format!("{spec}: playback channels without audio: {silent:?} of {}", probe.playback_channels));
         }
-        if probe.capture_channels > 0 && capture < RATE as u64 {
+        if probe.capture_channels > 0 && capture < probe.rate as u64 {
             failures.push(format!("{spec}: capture read for less than a second"));
         }
         if let (Some(usbip), Some(port)) = (&usbip, attached) {
