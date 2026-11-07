@@ -298,7 +298,10 @@ struct Pending {
 struct Connection {
     writer: Mutex<TcpStream>,
     pending: Mutex<Pending>,
+    /// isochronous transfers submitted or unlinked, or the connection closed
     changed: Condvar,
+    /// interrupt transfers submitted, or the connection closed: isochronous transfers don't wake their thread
+    interrupts_changed: Condvar,
 }
 
 impl Connection {
@@ -337,6 +340,7 @@ fn serve_imported(
         writer: Mutex::new(stream.try_clone()?),
         pending: Default::default(),
         changed: Condvar::new(),
+        interrupts_changed: Condvar::new(),
     });
     let completer = {
         let (connection, device, clock) = (connection.clone(), device.clone(), clock.clone());
@@ -355,6 +359,7 @@ fn serve_imported(
         pending.interrupts.iter().map(|urb| urb.notifier.clone()).collect()
     };
     connection.changed.notify_all();
+    connection.interrupts_changed.notify_all();
     notifiers.iter().for_each(Notifier::notify);
     let _ = completer.join();
     let _ = interrupter.join();
@@ -416,7 +421,7 @@ fn read_urbs(
                 if let Some(notifier) = device.interrupt_endpoint(address).filter(|_| direction == 1) {
                     let urb = InterruptUrb { seq, address, capacity: length, notifier: notifier.clone() };
                     connection.pending.lock().unwrap().interrupts.push_back(urb);
-                    connection.changed.notify_all();
+                    connection.interrupts_changed.notify_all();
                     notifier.notify();
                     continue;
                 }
@@ -531,7 +536,7 @@ fn complete_interrupts(connection: &Connection, device: &dyn UsbDevice) {
             return;
         }
         let Some(notifier) = pending.interrupts.front().map(|urb| urb.notifier.clone()) else {
-            pending = connection.changed.wait(pending).unwrap();
+            pending = connection.interrupts_changed.wait(pending).unwrap();
             continue;
         };
         // read before asking the device, so a notification from then on isn't missed
