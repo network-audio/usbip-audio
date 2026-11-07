@@ -98,6 +98,7 @@ fn serve(args: &[String]) -> Result<(), String> {
             capture_channels: capture,
             playback_name: None,
             capture_name: None,
+            capture_connector: false,
         };
         let probe = Arc::new(Probe {
             playback_channels: playback as usize,

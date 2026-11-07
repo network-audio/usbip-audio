@@ -25,5 +25,5 @@ pub mod uac2;
 pub mod usbip_exe;
 
 pub use clock::{Clock, MonotonicClock};
-pub use device::{IsoEndpoint, IsoTiming, Setup, Speed, UsbDevice, EPIPE};
+pub use device::{IsoEndpoint, IsoTiming, Notifier, Setup, Speed, UsbDevice, EPIPE};
 pub use server::Server;

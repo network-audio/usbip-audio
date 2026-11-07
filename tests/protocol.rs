@@ -25,7 +25,11 @@ impl Uac2Streams for Streams {
 }
 
 fn device(streams: Arc<Streams>) -> Arc<Uac2Device<Arc<Streams>>> {
-    let config = Uac2Config {
+    Arc::new(Uac2Device::new(config(false), streams).unwrap())
+}
+
+fn config(capture_connector: bool) -> Uac2Config {
+    Uac2Config {
         vendor_id: 0x1209,
         product_id: 0x0001,
         bcd_device: 0x0100,
@@ -37,8 +41,8 @@ fn device(streams: Arc<Streams>) -> Arc<Uac2Device<Arc<Streams>>> {
         capture_channels: 4,
         playback_name: None,
         capture_name: None,
-    };
-    Arc::new(Uac2Device::new(config, streams).unwrap())
+        capture_connector,
+    }
 }
 
 fn be32(bytes: &[u8]) -> u32 {
@@ -185,4 +189,89 @@ fn removing_a_device_closes_its_connection() {
     let mut byte = [0; 1];
     let closed = stream.read(&mut byte);
     assert!(matches!(closed, Ok(0) | Err(_)), "connection closed: {closed:?}");
+}
+
+fn unlink(seq: u32, unlinked: u32) -> Vec<u8> {
+    let mut out = vec![];
+    for value in [2, seq, 0x0001_0001, 0, 3, unlinked] {
+        out.extend_from_slice(&u32::to_be_bytes(value));
+    }
+    out.resize(48, 0);
+    out
+}
+
+/// GET_CUR of the capture terminal's connector control.
+fn connector(stream: &mut TcpStream, seq: u32) -> Vec<u8> {
+    stream.write_all(&submit(seq, 1, 0, 6, u32::MAX, [0xa1, 1, 0, 2, 0, 4, 6, 0], &[], &[])).unwrap();
+    let reply = read(stream, 48);
+    assert_eq!((be32(&reply[4..8]), be32(&reply[20..24])), (seq, 0));
+    read(stream, be32(&reply[24..28]) as usize)
+}
+
+fn assert_silent(stream: &mut TcpStream) {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    assert!(stream.read(&mut [0; 1]).is_err(), "no reply yet");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+}
+
+/// A connector change, as an AudioControl interrupt: CUR of the capture terminal's connector control.
+const CONNECTOR_CHANGED: [u8; 6] = [0, 1, 0, 2, 0, 4];
+
+#[test]
+fn interrupt_transfers_wait_for_connector_changes() {
+    let device = Arc::new(Uac2Device::new(config(true), Arc::new(Streams::default())).unwrap());
+    let server = Server::start(0, Arc::new(MonotonicClock::new())).unwrap();
+    server.add("1-1", device.clone());
+    let mut stream = import(&server, "1-1");
+    assert_eq!(connector(&mut stream, 1), [0; 6], "unplugged until connected");
+
+    // interrupt transfers stay pending until there is a change; usbip-win2 queues several
+    for seq in [2, 3] {
+        stream.write_all(&submit(seq, 1, 3, 8, 0, [0; 8], &[], &[])).unwrap();
+    }
+    assert_silent(&mut stream);
+    device.set_capture_connected(true);
+    let reply = read(&mut stream, 48);
+    assert_eq!((be32(&reply[0..4]), be32(&reply[4..8]), be32(&reply[20..24])), (3, 2, 0), "the oldest first");
+    assert_eq!(be32(&reply[24..28]), 6);
+    assert_eq!(read(&mut stream, 6), CONNECTOR_CHANGED);
+    assert_eq!(connector(&mut stream, 4), [4, 0, 0, 0, 0, 0], "all 4 channels connected");
+    assert_silent(&mut stream);
+
+    // the transfer still pending reports the next change
+    device.set_capture_connected(false);
+    let reply = read(&mut stream, 48);
+    assert_eq!(be32(&reply[4..8]), 3);
+    assert_eq!(read(&mut stream, 6), CONNECTOR_CHANGED);
+
+    // changes while none is pending are reported by the next one, at once
+    device.set_capture_connected(true);
+    device.set_capture_connected(false);
+    stream.write_all(&submit(5, 1, 3, 8, 0, [0; 8], &[], &[])).unwrap();
+    let reply = read(&mut stream, 48);
+    assert_eq!(be32(&reply[4..8]), 5);
+    assert_eq!(read(&mut stream, 6), CONNECTOR_CHANGED);
+    assert_eq!(connector(&mut stream, 6), [0; 6]);
+
+    // an unlinked interrupt transfer is never completed
+    stream.write_all(&submit(7, 1, 3, 8, 0, [0; 8], &[], &[])).unwrap();
+    stream.write_all(&unlink(8, 7)).unwrap();
+    let reply = read(&mut stream, 48);
+    assert_eq!((be32(&reply[0..4]), be32(&reply[4..8]), be32(&reply[20..24]) as i32), (4, 8, -104));
+    device.set_capture_connected(true);
+    assert_silent(&mut stream);
+    stream.write_all(&submit(9, 1, 3, 8, 0, [0; 8], &[], &[])).unwrap();
+    let reply = read(&mut stream, 48);
+    assert_eq!(be32(&reply[4..8]), 9, "the change waited for a transfer");
+    assert_eq!(read(&mut stream, 6), CONNECTOR_CHANGED);
+}
+
+#[test]
+fn interrupt_endpoints_need_a_connector() {
+    let server = Server::start(0, Arc::new(MonotonicClock::new())).unwrap();
+    server.add("1-1", device(Default::default()));
+    let mut stream = import(&server, "1-1");
+    stream.write_all(&submit(1, 1, 3, 8, 0, [0; 8], &[], &[])).unwrap();
+    let reply = read(&mut stream, 48);
+    assert_eq!((be32(&reply[4..8]), be32(&reply[20..24]) as i32), (1, -32));
 }
