@@ -6,8 +6,14 @@
 //! synchronous: the 125 µs microframes carry `sample_rate / 8000` frames on average (whole frames: e.g. 6 at
 //! 48 kHz, 5 or 6 at 44.1 kHz), and the [`Server`](crate::Server) completes the transfers by its
 //! [`Clock`](crate::Clock), which so is the clock of both streams.
+//!
+//! The capture terminal can have a connector ([`Uac2Config::capture_connector`]): Windows then shows the input
+//! unplugged until the application says it's connected ([`Uac2Device::set_capture_connected`]), e.g. while
+//! nothing is sending the audio it records. Changes reach Windows through the AudioControl interface's interrupt
+//! endpoint.
 
-use crate::device::{IsoEndpoint, IsoTiming, Setup, Speed, UsbDevice, EPIPE};
+use crate::device::{IsoEndpoint, IsoTiming, Notifier, Setup, Speed, UsbDevice, EPIPE};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 const MICROFRAME_NS: u64 = 125_000;
@@ -18,6 +24,9 @@ const MAX_HS_ISO_BYTES: usize = 3 * 1024;
 
 const PLAYBACK_EP: u8 = 0x01;
 const CAPTURE_EP: u8 = 0x82;
+const INTERRUPT_EP: u8 = 0x83;
+/// Connector control selector of a terminal
+const CONNECTOR_CONTROL: u8 = 0x02;
 const CLOCK_ID: u8 = 1;
 const PLAYBACK_INPUT_TERMINAL: u8 = 2;
 const PLAYBACK_OUTPUT_TERMINAL: u8 = 3;
@@ -52,6 +61,9 @@ pub struct Uac2Config {
     pub playback_name: Option<String>,
     /// Name of the capture terminal (shown by Windows as the input's name), if any
     pub capture_name: Option<String>,
+    /// Whether the capture terminal has a connector, unplugged until [`Uac2Device::set_capture_connected`];
+    /// without, the input is always plugged in
+    pub capture_connector: bool,
 }
 
 impl Uac2Config {
@@ -126,6 +138,16 @@ pub struct Uac2Device<S: Uac2Streams> {
     config: Uac2Config,
     streams: S,
     state: Mutex<State>,
+    connector: Connector,
+}
+
+/// The capture terminal's connector.
+#[derive(Default)]
+struct Connector {
+    connected: AtomicBool,
+    /// not yet reported through the interrupt endpoint
+    changed: AtomicBool,
+    notifier: Notifier,
 }
 
 /// Interface numbers: AudioControl is 0, then playback, then capture streaming (each only if it has channels).
@@ -163,7 +185,40 @@ fn microframe_frames(start_ns: u64, count: usize, rate: u32) -> impl Iterator<It
 impl<S: Uac2Streams> Uac2Device<S> {
     pub fn new(config: Uac2Config, streams: S) -> Result<Self, String> {
         config.validate()?;
-        Ok(Self { config, streams, state: Default::default() })
+        Ok(Self { config, streams, state: Default::default(), connector: Default::default() })
+    }
+
+    /// Plugs the capture terminal's connector in or out ([`Uac2Config::capture_connector`]).
+    pub fn set_capture_connected(&self, connected: bool) {
+        if self.connector.connected.swap(connected, Ordering::AcqRel) != connected {
+            self.connector.changed.store(true, Ordering::Release);
+            self.connector.notifier.notify();
+        }
+    }
+
+    /// Whether the capture terminal is plugged in: always, without a connector.
+    pub fn capture_connected(&self) -> bool {
+        !self.has_connector() || self.connector.connected.load(Ordering::Acquire)
+    }
+
+    fn has_connector(&self) -> bool {
+        self.config.capture_connector && self.config.capture_channels > 0
+    }
+
+    /// GET_CUR of the connector control: the channels connected (`AudioClusterDescriptor`), none when unplugged.
+    fn connector_request(&self, setup: Setup) -> Result<Vec<u8>, i32> {
+        match (setup.request_type, setup.request, (setup.value >> 8) as u8) {
+            (0xa1, 0x01, CONNECTOR_CONTROL) if self.has_connector() => {
+                let mut out = vec![0; 6];
+                if self.capture_connected() {
+                    let channels = self.config.capture_channels;
+                    out[0] = channels as u8;
+                    out[1..5].copy_from_slice(&channel_config(channels).to_le_bytes());
+                }
+                Ok(out)
+            }
+            _ => Err(EPIPE),
+        }
     }
 
     pub fn config(&self) -> &Uac2Config {
@@ -243,12 +298,14 @@ fn streaming_interface(out: &mut Vec<u8>, number: u8, terminal: u8, channels: u1
     out.extend_from_slice(&[8, 0x25, 0x01, 0, 0, 0, 0, 0]); // class-specific endpoint: no controls, no lock delay
 }
 
-fn input_terminal(out: &mut Vec<u8>, id: u8, terminal_type: u16, channels: u16, name: u8) {
+fn input_terminal(out: &mut Vec<u8>, id: u8, terminal_type: u16, channels: u16, controls: u16, name: u8) {
     out.extend_from_slice(&[17, 0x24, 0x02, id]);
     out.extend_from_slice(&terminal_type.to_le_bytes());
     out.extend_from_slice(&[0, CLOCK_ID, channels as u8]);
     out.extend_from_slice(&channel_config(channels).to_le_bytes());
-    out.extend_from_slice(&[0, 0, 0, name]);
+    out.push(0);
+    out.extend_from_slice(&controls.to_le_bytes());
+    out.push(name);
 }
 
 fn output_terminal(out: &mut Vec<u8>, id: u8, terminal_type: u16, source: u8, name: u8) {
@@ -281,25 +338,31 @@ impl<S: Uac2Streams> UsbDevice for Uac2Device<S> {
         let mut ac = vec![];
         ac.extend_from_slice(&[8, 0x24, 0x0a, CLOCK_ID, 0x01, 0x05, 0, 0]); // internal fixed clock, read-only
         if playback.is_some() {
-            input_terminal(&mut ac, PLAYBACK_INPUT_TERMINAL, 0x0101, c.playback_channels, 0); // USB streaming
+            input_terminal(&mut ac, PLAYBACK_INPUT_TERMINAL, 0x0101, c.playback_channels, 0, 0); // USB streaming
             let label = name(&c.playback_name, STRING_PLAYBACK);
             output_terminal(&mut ac, PLAYBACK_OUTPUT_TERMINAL, 0x0301, PLAYBACK_INPUT_TERMINAL, label);
             // speaker
         }
         if capture.is_some() {
             let label = name(&c.capture_name, STRING_CAPTURE);
-            input_terminal(&mut ac, CAPTURE_INPUT_TERMINAL, 0x0201, c.capture_channels, label); // microphone
+            let controls = if self.has_connector() { 0x0004 } else { 0 }; // connector control, read-only
+            input_terminal(&mut ac, CAPTURE_INPUT_TERMINAL, 0x0201, c.capture_channels, controls, label); // microphone
             output_terminal(&mut ac, CAPTURE_OUTPUT_TERMINAL, 0x0101, CAPTURE_INPUT_TERMINAL, 0);
         }
         let ac_total = (9 + ac.len()) as u16;
 
         let mut out = vec![9, 2, 0, 0, interfaces, 1, 0, 0x80, 50];
         out.extend_from_slice(&[8, 0x0b, 0, interfaces, 0x01, 0x00, 0x20, STRING_PRODUCT]); // association
-        out.extend_from_slice(&[9, 4, 0, 0, 0, 0x01, 0x01, 0x20, 0]); // AudioControl
+        let interrupt = self.has_connector();
+        out.extend_from_slice(&[9, 4, 0, 0, interrupt as u8, 0x01, 0x01, 0x20, 0]); // AudioControl
         out.extend_from_slice(&[9, 0x24, 0x01, 0x00, 0x02, 0x08]); // AC header, ADC 2.0, I/O box
         out.extend_from_slice(&ac_total.to_le_bytes());
         out.push(0);
         out.extend_from_slice(&ac);
+        if interrupt {
+            // interrupt messages of 6 bytes, polled every 4 ms (2^(6-1) microframes)
+            out.extend_from_slice(&[7, 5, INTERRUPT_EP, 0x03, 6, 0, 6]);
+        }
         if let Some(number) = playback {
             let bytes = c.packet_bytes(c.playback_channels);
             streaming_interface(&mut out, number, PLAYBACK_INPUT_TERMINAL, c.playback_channels, PLAYBACK_EP, bytes);
@@ -346,6 +409,10 @@ impl<S: Uac2Streams> UsbDevice for Uac2Device<S> {
                 drop(state);
                 self.clock_request(setup, data)
             }
+            (0xa1, _) if interface == 0 && (setup.index >> 8) as u8 == CAPTURE_INPUT_TERMINAL => {
+                drop(state);
+                self.connector_request(setup)
+            }
             _ => Err(EPIPE),
         }
     }
@@ -358,6 +425,18 @@ impl<S: Uac2Streams> UsbDevice for Uac2Device<S> {
             _ => false,
         };
         exists.then_some(IsoEndpoint { packet_ns: MICROFRAME_NS })
+    }
+
+    fn interrupt_endpoint(&self, address: u8) -> Option<Notifier> {
+        (address == INTERRUPT_EP && self.has_connector()).then(|| self.connector.notifier.clone())
+    }
+
+    fn interrupt_in(&self, address: u8, _capacity: usize) -> Option<Vec<u8>> {
+        if address != INTERRUPT_EP || !self.connector.changed.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        // class-specific, from the AudioControl interface: CUR of the capture terminal's connector control
+        Some(vec![0x00, 0x01, 0x00, CONNECTOR_CONTROL, 0x00, CAPTURE_INPUT_TERMINAL])
     }
 
     fn iso_out(&self, address: u8, timing: IsoTiming, packets: &[&[u8]]) {
@@ -452,6 +531,7 @@ mod tests {
             capture_channels: capture,
             playback_name: Some("Out".into()),
             capture_name: None,
+            capture_connector: false,
         }
     }
 
@@ -483,7 +563,7 @@ mod tests {
             let ac_total = u16::from_le_bytes([all[header][6], all[header][7]]) as usize;
             let ac_len: usize = all[header..].iter().take_while(|d| d[1] == 0x24).map(|d| d.len()).sum();
             assert_eq!(ac_total, ac_len);
-            let endpoints: Vec<_> = all.iter().filter(|d| d[1] == 5).collect();
+            let endpoints: Vec<_> = all.iter().filter(|d| d[1] == 5 && d[3] & 3 == 1).collect();
             assert_eq!(endpoints.len(), (playback > 0) as usize + (capture > 0) as usize);
             for endpoint in endpoints {
                 let max = u16::from_le_bytes([endpoint[4], endpoint[5]]) as usize;
@@ -494,6 +574,33 @@ mod tests {
             }
         }
         assert_eq!(Uac2Device::new(config(2, 2), Recorder::default()).unwrap().device_descriptor().len(), 18);
+    }
+
+    #[test]
+    fn a_capture_connector_has_an_interrupt_endpoint() {
+        for (playback, capture, connector) in [(2, 2, true), (0, 8, true), (2, 0, false)] {
+            let device = Uac2Device::new(
+                Uac2Config { capture_connector: true, ..config(playback, capture) },
+                Recorder::default(),
+            )
+            .unwrap();
+            let configuration = device.configuration_descriptor();
+            let all = descriptors(&configuration);
+            let interrupts: Vec<_> = all.iter().filter(|d| d[1] == 5 && d[3] == 0x03).collect();
+            assert_eq!(interrupts.len(), connector as usize, "{playback}x{capture}");
+            let control = all.iter().find(|d| d[1] == 4 && d[2] == 0).unwrap();
+            assert_eq!(control[4], connector as u8, "AudioControl's endpoints");
+            if connector {
+                assert_eq!(*interrupts[0], [7, 5, INTERRUPT_EP, 3, 6, 0, 6]);
+                let terminal =
+                    all.iter().find(|d| d[1] == 0x24 && d[2] == 0x02 && d[3] == CAPTURE_INPUT_TERMINAL).unwrap();
+                assert_eq!(u16::from_le_bytes([terminal[14], terminal[15]]), 0x0004, "connector control, read-only");
+            }
+            assert_eq!(device.interrupt_endpoint(INTERRUPT_EP).is_some(), connector);
+        }
+        let plain = Uac2Device::new(config(2, 2), Recorder::default()).unwrap();
+        assert!(plain.interrupt_endpoint(INTERRUPT_EP).is_none());
+        assert!(plain.capture_connected(), "always plugged in without a connector");
     }
 
     #[test]

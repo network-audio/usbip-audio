@@ -2,9 +2,9 @@
 //! <https://www.kernel.org/doc/html/latest/usb/usbip_protocol.html>.
 
 use crate::clock::Clock;
-use crate::device::{IsoTiming, Setup, UsbDevice, EPIPE};
+use crate::device::{IsoTiming, Notifier, Setup, UsbDevice, EPIPE};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -25,6 +25,8 @@ const MAX_ISO_PACKETS: usize = 1024;
 /// An endpoint's transfers continue the previous one's timing, unless that ended longer ago than this (the
 /// stream was stopped): then they restart from the present.
 const RESYNC_NS: u64 = 20_000_000;
+/// How long an interrupt transfer may wait for a notification it missed (none should be missed).
+const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 static URB_ERRORS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 struct Exported {
@@ -276,10 +278,20 @@ struct PendingUrb {
     out_lengths: Vec<usize>,
 }
 
+/// An interrupt IN transfer waiting for the device to have data.
+struct InterruptUrb {
+    seq: u32,
+    address: u8,
+    capacity: usize,
+    notifier: Notifier,
+}
+
 #[derive(Default)]
 struct Pending {
     due: BinaryHeap<Reverse<(u64, u32)>>,
     urbs: HashMap<u32, PendingUrb>,
+    /// in the order they were submitted
+    interrupts: VecDeque<InterruptUrb>,
     closed: bool,
 }
 
@@ -330,10 +342,22 @@ fn serve_imported(
         let (connection, device, clock) = (connection.clone(), device.clone(), clock.clone());
         thread::Builder::new().name("usbip-iso".into()).spawn(move || complete_iso(&connection, &*device, &*clock))?
     };
+    let interrupter = {
+        let (connection, device) = (connection.clone(), device.clone());
+        thread::Builder::new()
+            .name("usbip-interrupt".into())
+            .spawn(move || complete_interrupts(&connection, &*device))?
+    };
     let result = read_urbs(&mut stream, &connection, &*device, active, stop, &**clock);
-    connection.pending.lock().unwrap().closed = true;
+    let notifiers: Vec<Notifier> = {
+        let mut pending = connection.pending.lock().unwrap();
+        pending.closed = true;
+        pending.interrupts.iter().map(|urb| urb.notifier.clone()).collect()
+    };
     connection.changed.notify_all();
+    notifiers.iter().for_each(Notifier::notify);
     let _ = completer.join();
+    let _ = interrupter.join();
     let _ = stream.shutdown(std::net::Shutdown::Both);
     result
 }
@@ -389,6 +413,13 @@ fn read_urbs(
                     connection.send(&reply)?;
                     continue;
                 }
+                if let Some(notifier) = device.interrupt_endpoint(address).filter(|_| direction == 1) {
+                    let urb = InterruptUrb { seq, address, capacity: length, notifier: notifier.clone() };
+                    connection.pending.lock().unwrap().interrupts.push_back(urb);
+                    connection.changed.notify_all();
+                    notifier.notify();
+                    continue;
+                }
                 let Some(endpoint) = device.iso_endpoint(address).filter(|_| iso_packets > 0) else {
                     log_failure(&format!("transfer to endpoint {address:#04x}, {iso_packets} iso packets"));
                     connection.send(&ret_submit(seq, EPIPE, 0, start_frame, packets))?;
@@ -419,9 +450,14 @@ fn read_urbs(
             CMD_UNLINK => {
                 let unlinked = be32(&header[20..24]);
                 // a transfer still waiting is never completed; one already completed is acknowledged with 0
-                let status = match connection.pending.lock().unwrap().urbs.remove(&unlinked) {
-                    Some(_) => ECONNRESET,
-                    None => 0,
+                let status = {
+                    let mut pending = connection.pending.lock().unwrap();
+                    let interrupt = pending.interrupts.iter().position(|urb| urb.seq == unlinked);
+                    let interrupt = interrupt.and_then(|at| pending.interrupts.remove(at));
+                    match (pending.urbs.remove(&unlinked), interrupt) {
+                        (None, None) => 0,
+                        _ => ECONNRESET,
+                    }
                 };
                 let mut out = Vec::with_capacity(48);
                 for value in [RET_UNLINK, seq, 0, 0, 0, status as u32] {
@@ -480,6 +516,49 @@ fn complete_iso(connection: &Connection, device: &dyn UsbDevice, clock: &dyn Clo
             put_u32(&mut reply, length as u32);
             put_u32(&mut reply, 0);
         }
+        if connection.send(&reply).is_err() {
+            return;
+        }
+        pending = connection.pending.lock().unwrap();
+    }
+}
+
+/// Completes interrupt transfers when the device has data for them: each endpoint's oldest first.
+fn complete_interrupts(connection: &Connection, device: &dyn UsbDevice) {
+    let mut pending = connection.pending.lock().unwrap();
+    loop {
+        if pending.closed {
+            return;
+        }
+        let Some(notifier) = pending.interrupts.front().map(|urb| urb.notifier.clone()) else {
+            pending = connection.changed.wait(pending).unwrap();
+            continue;
+        };
+        // read before asking the device, so a notification from then on isn't missed
+        let seen = notifier.count();
+        let mut addresses = vec![];
+        let mut completed = None;
+        for (at, urb) in pending.interrupts.iter().enumerate() {
+            if addresses.contains(&urb.address) {
+                continue;
+            }
+            addresses.push(urb.address);
+            if let Some(mut data) = device.interrupt_in(urb.address, urb.capacity) {
+                data.truncate(urb.capacity);
+                completed = Some((at, data));
+                break;
+            }
+        }
+        let Some((at, data)) = completed else {
+            drop(pending);
+            notifier.wait(seen, INTERRUPT_POLL);
+            pending = connection.pending.lock().unwrap();
+            continue;
+        };
+        let urb = pending.interrupts.remove(at).unwrap();
+        drop(pending);
+        let mut reply = ret_submit(urb.seq, 0, data.len(), 0, 0);
+        reply.extend_from_slice(&data);
         if connection.send(&reply).is_err() {
             return;
         }
